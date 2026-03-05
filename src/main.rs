@@ -131,23 +131,8 @@ async fn main() -> Result<()> {
         verb, total, args.tag
     ));
 
-    for txn in first_page.data {
-        if !args.dry_run {
-            delete_transaction(&client, base_url, &args.token, &txn.id).await?;
-        }
-        pb.inc(1);
-        if let Some(split) = txn.attributes.transactions.first() {
-            pb.set_message(format!(
-                "{} {} transaction(s) with tag '{}'\n  {} | {} | {}",
-                verb, total, args.tag, split.date, split.description, split.amount
-            ));
-        }
-    }
-
-    for page in 2..=total_pages {
-        let page_data =
-            fetch_transactions_page(&client, base_url, &args.token, &args.tag, page).await?;
-        for txn in page_data.data {
+    let process_page =|txns: Vec<TransactionRead>| async {
+        for txn in txns {
             if !args.dry_run {
                 delete_transaction(&client, base_url, &args.token, &txn.id).await?;
             }
@@ -158,6 +143,29 @@ async fn main() -> Result<()> {
                     verb, total, args.tag, split.date, split.description, split.amount
                 ));
             }
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    if args.dry_run {
+        // Data isn't changing, so normal sequential pagination is stable.
+        process_page(first_page.data).await?;
+        for page in 2..=total_pages {
+            let page_data =
+                fetch_transactions_page(&client, base_url, &args.token, &args.tag, page).await?;
+            process_page(page_data.data).await?;
+        }
+    } else {
+        // After deleting page 1, what was page 2 shifts down to page 1.
+        // Always re-fetch page 1 until the server returns nothing.
+        process_page(first_page.data).await?;
+        loop {
+            let page_data =
+                fetch_transactions_page(&client, base_url, &args.token, &args.tag, 1).await?;
+            if page_data.data.is_empty() {
+                break;
+            }
+            process_page(page_data.data).await?;
         }
     }
 
