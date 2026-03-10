@@ -25,6 +25,23 @@ struct Args {
 }
 
 #[derive(Deserialize)]
+struct TagArray {
+    data: Vec<TagRead>,
+    meta: Meta,
+}
+
+#[derive(Deserialize)]
+struct TagRead {
+    id: String,
+    attributes: TagModel,
+}
+
+#[derive(Deserialize)]
+struct TagModel {
+    tag: String,
+}
+
+#[derive(Deserialize)]
 struct TransactionArray {
     data: Vec<TransactionRead>,
     meta: Meta,
@@ -59,14 +76,48 @@ struct Pagination {
     total_pages: u32,
 }
 
+/// Fetch all tags from the server and return the numeric ID of the tag matching `name`.
+async fn resolve_tag_id(client: &Client, base_url: &str, token: &str, name: &str) -> Result<String> {
+    let url = format!("{}/api/v1/tags", base_url);
+    let mut page = 1u32;
+    loop {
+        let resp = client
+            .get(&url)
+            .bearer_auth(token)
+            .query(&[("page", page)])
+            .send()
+            .await
+            .context("Failed to fetch tags")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("HTTP {} fetching tags: {}", status, body);
+        }
+
+        let tag_array = resp.json::<TagArray>().await.context("Failed to parse tags response")?;
+
+        if let Some(found) = tag_array.data.into_iter().find(|t| t.attributes.tag == name) {
+            return Ok(found.id);
+        }
+
+        if page >= tag_array.meta.pagination.total_pages {
+            break;
+        }
+        page += 1;
+    }
+
+    anyhow::bail!("Tag '{}' not found", name);
+}
+
 async fn fetch_transactions_page(
     client: &Client,
     base_url: &str,
     token: &str,
-    tag: &str,
+    tag_id: &str,
     page: u32,
 ) -> Result<TransactionArray> {
-    let url = format!("{}/api/v1/tags/{}/transactions", base_url, tag);
+    let url = format!("{}/api/v1/tags/{}/transactions", base_url, tag_id);
     let resp: reqwest::Response = client
         .get(&url)
         .bearer_auth(token)
@@ -110,7 +161,9 @@ async fn main() -> Result<()> {
     let base_url = args.url.trim_end_matches('/');
     let client = Client::new();
 
-    let first_page = fetch_transactions_page(&client, base_url, &args.token, &args.tag, 1).await?;
+    let tag_id = resolve_tag_id(&client, base_url, &args.token, &args.tag).await?;
+
+    let first_page = fetch_transactions_page(&client, base_url, &args.token, &tag_id, 1).await?;
     let total = first_page.meta.pagination.total;
     let total_pages = first_page.meta.pagination.total_pages;
 
@@ -152,7 +205,7 @@ async fn main() -> Result<()> {
         process_page(first_page.data).await?;
         for page in 2..=total_pages {
             let page_data =
-                fetch_transactions_page(&client, base_url, &args.token, &args.tag, page).await?;
+                fetch_transactions_page(&client, base_url, &args.token, &tag_id, page).await?;
             process_page(page_data.data).await?;
         }
     } else {
@@ -161,7 +214,7 @@ async fn main() -> Result<()> {
         process_page(first_page.data).await?;
         loop {
             let page_data =
-                fetch_transactions_page(&client, base_url, &args.token, &args.tag, 1).await?;
+                fetch_transactions_page(&client, base_url, &args.token, &tag_id, 1).await?;
             if page_data.data.is_empty() {
                 break;
             }
